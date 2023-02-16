@@ -212,6 +212,12 @@ class PPYOLOEHead(YOLOv6Head):
         # ppyoloe doesn't need loss_obj
         self.loss_obj = None
 
+    def get_assigned_result(self, assigned_result):
+        assigned_bboxes = assigned_result['assigned_bboxes']
+        assigned_scores = assigned_result['assigned_scores']
+        fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
+        return assigned_bboxes, assigned_scores, fg_mask_pre_prior
+
     def loss_by_feat(
             self,
             cls_scores: Sequence[Tensor],
@@ -311,9 +317,11 @@ class PPYOLOEHead(YOLOv6Head):
                                             gt_labels, gt_bboxes,
                                             pad_bbox_flag)
 
-        assigned_bboxes = assigned_result['assigned_bboxes']
-        assigned_scores = assigned_result['assigned_scores']
-        fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
+        # assigned_bboxes = assigned_result['assigned_bboxes']
+        # assigned_scores = assigned_result['assigned_scores']
+        # fg_mask_pre_prior = assigned_result['fg_mask_pre_prior']
+        assigned_bboxes, assigned_scores, fg_mask_pre_prior = \
+            self.get_assigned_result(assigned_result)
 
         # cls loss
         with torch.cuda.amp.autocast(enabled=False):
