@@ -3,6 +3,7 @@ from typing import List, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.cnn import ConvModule
 from mmdet.models.utils import multi_apply
 from mmdet.utils import (ConfigType, OptConfigType, OptInstanceList,
@@ -157,7 +158,90 @@ class YOLOv6HeadModule(BaseModule):
         cls_score = cls_pred(cls_feat)
         bbox_pred = reg_pred(reg_feat)
 
-        return cls_score, bbox_pred
+        return cls_score, bbox_pred, None
+
+
+@MODELS.register_module()
+class YOLOv6HeadModuleWithDFL(YOLOv6HeadModule):
+
+    def __init__(self, reg_max: int = 16, *args, **kwargs):
+        self.reg_max = reg_max
+        super().__init__(*args, **kwargs)
+
+    def _init_layers(self):
+        """initialize conv layers in YOLOv6 head."""
+        # Init decouple head
+        self.cls_convs = nn.ModuleList()
+        self.reg_convs = nn.ModuleList()
+        self.cls_preds = nn.ModuleList()
+        self.reg_preds = nn.ModuleList()
+        self.stems = nn.ModuleList()
+        for i in range(self.num_levels):
+            self.stems.append(
+                ConvModule(
+                    in_channels=self.in_channels[i],
+                    out_channels=self.in_channels[i],
+                    kernel_size=1,
+                    stride=1,
+                    padding=1 // 2,
+                    norm_cfg=self.norm_cfg,
+                    act_cfg=self.act_cfg))
+            self.cls_convs.append(
+                ConvModule(
+                    in_channels=self.in_channels[i],
+                    out_channels=self.in_channels[i],
+                    kernel_size=3,
+                    stride=1,
+                    padding=3 // 2,
+                    norm_cfg=self.norm_cfg,
+                    act_cfg=self.act_cfg))
+            self.reg_convs.append(
+                ConvModule(
+                    in_channels=self.in_channels[i],
+                    out_channels=self.in_channels[i],
+                    kernel_size=3,
+                    stride=1,
+                    padding=3 // 2,
+                    norm_cfg=self.norm_cfg,
+                    act_cfg=self.act_cfg))
+            self.cls_preds.append(
+                nn.Conv2d(
+                    in_channels=self.in_channels[i],
+                    out_channels=self.num_base_priors * self.num_classes,
+                    kernel_size=1))
+            self.reg_preds.append(
+                nn.Conv2d(
+                    in_channels=self.in_channels[i],
+                    out_channels=self.num_base_priors * 4 * (self.reg_max + 1),
+                    kernel_size=1))
+
+        # init proj
+        proj = torch.linspace(0, self.reg_max, self.reg_max + 1).view(
+            [1, self.reg_max + 1, 1, 1])
+        self.register_buffer('proj', proj, persistent=False)
+
+    def forward_single(self, x: Tensor, stem: nn.Module, cls_conv: nn.Module,
+                       cls_pred: nn.Module, reg_conv: nn.Module,
+                       reg_pred: nn.Module) -> Tuple[Tensor, Tensor]:
+        """Forward feature of a single scale level."""
+        b, _, h, w = x.shape
+        hw = h * w
+
+        y = stem(x)
+        cls_x = y
+        reg_x = y
+        cls_feat = cls_conv(cls_x)
+        reg_feat = reg_conv(reg_x)
+
+        cls_score = cls_pred(cls_feat)
+        bbox_dist_pred = reg_pred(reg_feat)
+        bbox_dist_pred = bbox_dist_pred.reshape(
+            [-1, 4 * self.num_base_priors, self.reg_max + 1,
+             hw]).permute(0, 2, 3, 1)
+        bbox_pred = F.conv2d(F.softmax(bbox_dist_pred, dim=1),
+                             self.proj)  # n, reg+1, hw, 4na
+
+        return cls_score, bbox_pred, bbox_dist_pred
 
 
 @MODELS.register_module()
@@ -201,6 +285,7 @@ class YOLOv6Head(YOLOv5Head):
                      reduction='mean',
                      loss_weight=2.5,
                      return_iou=False),
+                 loss_dfl: OptConfigType = None,
                  train_cfg: OptConfigType = None,
                  test_cfg: OptConfigType = None,
                  init_cfg: OptMultiConfig = None):
@@ -213,6 +298,12 @@ class YOLOv6Head(YOLOv5Head):
             train_cfg=train_cfg,
             test_cfg=test_cfg,
             init_cfg=init_cfg)
+        if loss_dfl is not None:
+            self.use_dfl = True
+            self.loss_dfl = MODELS.build(loss_dfl)
+        else:
+            self.use_dfl = False
+            self.loss_dfl = None
         # yolov6 doesn't need loss_obj
         self.loss_obj = None
 
@@ -238,6 +329,7 @@ class YOLOv6Head(YOLOv5Head):
             self,
             cls_scores: Sequence[Tensor],
             bbox_preds: Sequence[Tensor],
+            bbox_dist_preds: Sequence[Tensor],
             batch_gt_instances: Sequence[InstanceData],
             batch_img_metas: Sequence[dict],
             batch_gt_instances_ignore: OptInstanceList = None) -> dict:
@@ -308,6 +400,15 @@ class YOLOv6Head(YOLOv5Head):
             for bbox_pred in bbox_preds
         ]
 
+        if self.use_dfl:
+            # (bs, reg_max+1, n, 4) -> (bs, n, 4, reg_max+1)
+            flatten_pred_dists = [
+                bbox_pred_org.permute(0, 2, 3, 1).reshape(
+                    num_imgs, -1, (self.head_module.reg_max + 1) * 4)
+                for bbox_pred_org in bbox_dist_preds
+            ]
+            flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
+
         flatten_cls_preds = torch.cat(flatten_cls_preds, dim=1)
         flatten_pred_bboxes = torch.cat(flatten_pred_bboxes, dim=1)
         flatten_pred_bboxes = self.bbox_coder.decode(
@@ -361,9 +462,34 @@ class YOLOv6Head(YOLOv5Head):
                 assigned_bboxes_pos,
                 weight=bbox_weight,
                 avg_factor=assigned_scores_sum)
+
+            if self.use_dfl:
+                # dfl loss
+                dist_mask = fg_mask_pre_prior.unsqueeze(-1).repeat(
+                    [1, 1, (self.head_module.reg_max + 1) * 4])
+                pred_dist_pos = torch.masked_select(
+                    flatten_dist_preds,
+                    dist_mask).reshape([-1, 4, self.head_module.reg_max + 1])
+                assigned_ltrb = self.bbox_coder.encode(
+                    self.flatten_priors_train[..., :2] / self.stride_tensor,
+                    assigned_bboxes,
+                    max_dis=self.head_module.reg_max,
+                    eps=0.01)
+                assigned_ltrb_pos = torch.masked_select(
+                    assigned_ltrb, prior_bbox_mask).reshape([-1, 4])
+                loss_dfl = self.loss_dfl(
+                    pred_dist_pos.reshape(-1, self.head_module.reg_max + 1),
+                    assigned_ltrb_pos.reshape(-1),
+                    weight=bbox_weight.expand(-1, 4).reshape(-1),
+                    avg_factor=assigned_scores_sum)
         else:
             loss_bbox = flatten_pred_bboxes.sum() * 0
+            loss_dfl = flatten_pred_bboxes.sum() * 0
 
         _, world_size = get_dist_info()
-        return dict(
+
+        output = dict(
             loss_cls=loss_cls * world_size, loss_bbox=loss_bbox * world_size)
+        if self.use_dfl:
+            output['loss_dfl'] = loss_dfl * num_imgs * world_size
+        return output
