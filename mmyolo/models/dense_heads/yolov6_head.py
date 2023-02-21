@@ -158,7 +158,10 @@ class YOLOv6HeadModule(BaseModule):
         cls_score = cls_pred(cls_feat)
         bbox_pred = reg_pred(reg_feat)
 
-        return cls_score, bbox_pred, None
+        if self.training:
+            return cls_score, bbox_pred, None
+        else:
+            return cls_score, bbox_pred
 
 
 @MODELS.register_module()
@@ -237,11 +240,14 @@ class YOLOv6HeadModuleWithDFL(YOLOv6HeadModule):
         bbox_dist_pred = reg_pred(reg_feat)
         bbox_dist_pred = bbox_dist_pred.reshape(
             [-1, 4 * self.num_base_priors, self.reg_max + 1,
-             hw]).permute(0, 2, 3, 1)
+             hw]).permute(0, 2, 3, 1)  # n, reg+1, hw, 4na
         bbox_pred = F.conv2d(F.softmax(bbox_dist_pred, dim=1),
-                             self.proj)  # n, reg+1, hw, 4na
+                             self.proj)  # n, 1, hw, 4na
 
-        return cls_score, bbox_pred, bbox_dist_pred
+        if self.training:
+            return cls_score, bbox_pred, bbox_dist_pred
+        else:
+            return cls_score, bbox_pred
 
 
 @MODELS.register_module()
@@ -407,6 +413,7 @@ class YOLOv6Head(YOLOv5Head):
                     num_imgs, -1, (self.head_module.reg_max + 1) * 4)
                 for bbox_pred_org in bbox_dist_preds
             ]
+            # bs, mlvl_n, 4*(reg_max+1)
             flatten_dist_preds = torch.cat(flatten_pred_dists, dim=1)
 
         flatten_cls_preds = torch.cat(flatten_cls_preds, dim=1)
@@ -491,5 +498,5 @@ class YOLOv6Head(YOLOv5Head):
         output = dict(
             loss_cls=loss_cls * world_size, loss_bbox=loss_bbox * world_size)
         if self.use_dfl:
-            output['loss_dfl'] = loss_dfl * num_imgs * world_size
+            output['loss_dfl'] = loss_dfl * world_size
         return output
